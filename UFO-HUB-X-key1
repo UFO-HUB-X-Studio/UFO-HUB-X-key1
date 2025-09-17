@@ -1,1 +1,247 @@
+-- UFO-HUB-X-key1
+-- Auto Key Finder (single-file module) for UFO HUB X Key UI
+-- คืนค่าเป็น table { findKey(gameName) -> string | {string,...} }
+-- จุดเด่น:
+--  - ดึงคีย์จากหลายแหล่ง (ปรับ ALT_KEY_SOURCES ได้)
+--  - รองรับ JSON/plain text หลากหลายรูปแบบ
+--  - เลือกคีย์ตามชื่อเกมได้ (games{} / per-game key)
+--  - มี cache ป้องกันยิงซ้ำ (ปรับ TTL หรือปิดได้)
+--  - ไม่ทำอะไรนอกจาก "หา/คืนค่า key" — ปลอดภัยกับ UI เดิมของคุณ
 
+-------------------- Compat / Services --------------------
+local HttpService = game:GetService("HttpService")
+local MarketplaceService = game:GetService("MarketplaceService")
+
+local function LOG(msg)
+    local s = "[UFO-KEY1] " .. tostring(msg)
+    if rconsoleprint then rconsoleprint(s.."\n") else print(s) end
+end
+
+-------------------- HTTP helpers --------------------
+local function http_get(url)
+    if http and http.request then
+        local ok, res = pcall(http.request, {Url=url, Method="GET"})
+        if ok and res and (res.Body or res.body) then return true, (res.Body or res.body) end
+    end
+    if syn and syn.request then
+        local ok, res = pcall(syn.request, {Url=url, Method="GET"})
+        if ok and res and (res.Body or res.body) then return true, (res.Body or res.body) end
+    end
+    local ok, body = pcall(function() return game:HttpGet(url) end)
+    if ok and body then return true, body end
+    return false, "httpget_failed"
+end
+
+local function http_get_retry(urls, tries, delay_s)
+    local list = {}
+    if type(urls)=="table" then list = urls else list = {urls} end
+    tries   = tries or 2
+    delay_s = delay_s or 0.5
+    for round=1, tries do
+        for _,u in ipairs(list) do
+            LOG(("try #%d → %s"):format(round, u))
+            local ok, body = http_get(u)
+            if ok and body then return true, body, u end
+        end
+        task.wait(delay_s * round)
+    end
+    return false, "retry_failed"
+end
+
+-------------------- FS cache (optional) --------------------
+local DIR        = "UFOHubX"
+local CACHE_FILE = DIR.."/key_cache.json"
+local CACHE_ENABLED = true          -- ปิด cache ตั้ง false
+local CACHE_TTL    = 900            -- วินาที (15 นาที) ถ้า server ไม่ให้ expires_at
+
+local function ensureDir()
+    if isfolder then
+        if not isfolder(DIR) then pcall(makefolder, DIR) end
+    end
+end
+ensureDir()
+
+local function readCache()
+    if not CACHE_ENABLED then return nil end
+    if not (isfile and readfile and isfile(CACHE_FILE)) then return nil end
+    local ok, data = pcall(readfile, CACHE_FILE)
+    if not ok or not data or #data==0 then return nil end
+    local ok2, js = pcall(function() return HttpService:JSONDecode(data) end)
+    if not ok2 or type(js)~="table" then return nil end
+    -- { key="...", game="...", expires_at=..., saved_at=... }
+    if js.expires_at and typeof(js.expires_at)=="number" then
+        if os.time() >= js.expires_at then return nil end
+    else
+        if js.saved_at and typeof(js.saved_at)=="number" then
+            if os.time() - js.saved_at > CACHE_TTL then return nil end
+        else
+            return nil
+        end
+    end
+    return js
+end
+
+local function writeCache(key, gameName, expires_at)
+    if not CACHE_ENABLED then return end
+    if not writefile then return end
+    local obj = {
+        key        = key,
+        game       = gameName,
+        saved_at   = os.time(),
+        expires_at = expires_at or nil,
+    }
+    local ok, json = pcall(function() return HttpService:JSONEncode(obj) end)
+    if ok then pcall(writefile, CACHE_FILE, json) end
+end
+
+-------------------- Config: sources you own --------------------
+-- ปรับ/เพิ่มแหล่งคีย์ได้ที่นี่ (ลำดับมาก่อน ตรวจ/ดึงก่อน)
+-- TIP: ถ้าคุณมี server ที่แจกคีย์ แนะนำทำ shape JSON ที่อ่านง่าย เช่น:
+--   {"key":"ABCDEF","expires_in":3600}
+--   หรือ {"keys":["K1","K2"],"expires_at":1700000000}
+--   หรือ {"games":{"Grow a Garden":"G-GARDEN-123","default":"FALLBACK-KEY"}}
+local ALT_KEY_SOURCES = {
+    -- ตัวอย่าง: repo key2 ของคุณ (แก้ path ตามจริง)
+    "https://raw.githubusercontent.com/UFO-HUB-X-Studio/UFO-HUB-X-key2/refs/heads/main/UFO-HUB-X-key2",
+
+    -- ถ้าคุณมี endpoint แจกคีย์จริง (ใส่เป็น template ได้)
+    -- "https://ufo-hub-x-key.onrender.com/get?user={userid}&place={placeid}",
+}
+
+-------------------- Parse candidates --------------------
+local function norm(s)
+    s = tostring(s or ""):gsub("^%s+",""):gsub("%s+$","")
+    return s
+end
+
+-- ดึงคีย์ที่เป็นไปได้จาก JSON หรือข้อความดิบ
+-- ต้องคืน { "KEY1", "KEY2", ... }, exp(optional)
+local function parseCandidates(txt, gameName)
+    txt = tostring(txt or "")
+    local candidates = {}
+    local expires_at = nil
+
+    -- 1) ลอง JSON ก่อน
+    local isJSON, js = pcall(function() return HttpService:JSONDecode(txt) end)
+    if isJSON and type(js)=="table" then
+        -- กรณีสากล: {"key":"..."} / {"keys":[...]}
+        if type(js.key)=="string" and #js.key>0 then
+            table.insert(candidates, norm(js.key))
+        end
+        if type(js.keys)=="table" then
+            for _,k in ipairs(js.keys) do
+                if type(k)=="string" and #k>0 then table.insert(candidates, norm(k)) end
+            end
+        end
+        -- ต่อ game: {"games":{"Grow a Garden":"...","default":"..."}}
+        if type(js.games)=="table" then
+            local g = js.games[gameName]
+            if type(g)=="string" and #g>0 then table.insert(candidates, norm(g)) end
+            local fallback = js.games["default"]
+            if type(fallback)=="string" and #fallback>0 then table.insert(candidates, norm(fallback)) end
+        end
+        -- expiry
+        if js.expires_at then
+            local n = tonumber(js.expires_at); if n then expires_at = n end
+        elseif js.expires_in then
+            local n = tonumber(js.expires_in); if n then expires_at = os.time() + n end
+        end
+    else
+        -- 2) plain text: หยิบ pattern key ที่ดูสมเหตุสมผล (A-Z0-9 6+)
+        for token in txt:gmatch("[A-Za-z0-9%-_]{6,}") do
+            table.insert(candidates, norm(token))
+        end
+    end
+
+    -- dedupe
+    local seen = {}
+    local unique = {}
+    for _,k in ipairs(candidates) do
+        if not seen[k] then seen[k]=true; table.insert(unique, k) end
+    end
+    return unique, expires_at
+end
+
+-------------------- Utils --------------------
+local function getGameName()
+    local ok, info = pcall(function()
+        return MarketplaceService:GetProductInfo(game.PlaceId)
+    end)
+    if ok and info and info.Name then return tostring(info.Name) end
+    return "default"
+end
+
+local function applyTemplate(url)
+    -- รองรับ {userid} {username} {placeid}
+    local player = game.Players.LocalPlayer
+    local uid = (player and player.UserId) or 0
+    local uname = (player and player.Name) or "Player"
+    local pid = game.PlaceId or 0
+    local out = url
+    out = out:gsub("{userid}", tostring(uid))
+    out = out:gsub("{username}", tostring(uname))
+    out = out:gsub("{placeid}", tostring(pid))
+    return out
+end
+
+-------------------- Main: findKey(gameName) --------------------
+local M = {}
+
+-- คืน string เดียว (ตัวที่ดีที่สุด) หรือ table ของตัวเลือกทั้งหมด (ให้ UI ตัดสินใจต่อได้)
+function M.findKey(gameName)
+    gameName = tostring(gameName or getGameName())
+    LOG("findKey for game: "..gameName)
+
+    -- 1) ใช้ cache ก่อน (ถ้าเกมตรงกัน)
+    local cache = readCache()
+    if cache and type(cache.key)=="string" and cache.game == gameName then
+        LOG("use cache key")
+        return cache.key
+    end
+
+    -- 2) ไล่ยิงแหล่งข้อมูลที่กำหนด
+    local allCandidates = {}
+    local bestExpiry = nil
+
+    for _, base in ipairs(ALT_KEY_SOURCES) do
+        local url = applyTemplate(base)
+        local ok, body = http_get(url)
+        if ok and body and #body>0 then
+            local items, exp = parseCandidates(body, gameName)
+            if items and #items>0 then
+                -- เก็บ candidates ทั้งหมด (เพื่อให้ UI ใช้หลายช้อยส์ได้)
+                for _,k in ipairs(items) do table.insert(allCandidates, k) end
+                if exp and (not bestExpiry or exp > bestExpiry) then bestExpiry = exp end
+            end
+        end
+    end
+
+    -- 3) dedupe ผู้สมัครทั้งหมด
+    do
+        local seen = {}
+        local uniq = {}
+        for _,k in ipairs(allCandidates) do
+            if type(k)=="string" and #k>0 then
+                local nk = k
+                if not seen[nk] then seen[nk]=true; table.insert(uniq, nk) end
+            end
+        end
+        allCandidates = uniq
+    end
+
+    -- 4) ตัดสินใจคืนค่า
+    if #allCandidates == 0 then
+        LOG("no key candidates found")
+        return nil
+    elseif #allCandidates == 1 then
+        -- เขียน cache
+        writeCache(allCandidates[1], gameName, bestExpiry)
+        return allCandidates[1]
+    else
+        -- หลายตัวเลือก → เขียน cache ตัวแรกไว้ก่อน (แก้ภายหลังได้)
+        writeCache(allCandidates[1], gameName, bestExpiry)
+        return allCandidates
+    end
+end
+
+return M

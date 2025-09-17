@@ -1,247 +1,408 @@
--- UFO-HUB-X-key1
--- Auto Key Finder (single-file module) for UFO HUB X Key UI
--- คืนค่าเป็น table { findKey(gameName) -> string | {string,...} }
--- จุดเด่น:
---  - ดึงคีย์จากหลายแหล่ง (ปรับ ALT_KEY_SOURCES ได้)
---  - รองรับ JSON/plain text หลากหลายรูปแบบ
---  - เลือกคีย์ตามชื่อเกมได้ (games{} / per-game key)
---  - มี cache ป้องกันยิงซ้ำ (ปรับ TTL หรือปิดได้)
---  - ไม่ทำอะไรนอกจาก "หา/คืนค่า key" — ปลอดภัยกับ UI เดิมของคุณ
+-- UFO HUB X key.lua  (Key UI + Online Validator via key2 JSON)
+-- ✅ ต่อกับไฟล์ key2 (JSON) เพื่อยืนยันว่าคีย์ที่ผู้ใช้กรอก "ถูกต้องจากเว็บจริง"
+-- ✅ รองรับ JSON ได้ 2 รูปแบบ:
+--    1) { "valid_keys": ["A","B",...], "expires_in": 3600 }
+--    2) { "games": { "Grow a Garden": "AAA", ... }, "expires_in": 3600 }
+-- ✅ ผ่านแล้ว call: _G.UFO_SaveKeyState(key, expires_at, false) แล้ว _G.UFO_StartDownload()
+-- ❌ ปิดด้วยปุ่ม X จะ "ไม่" เรียกดาวน์โหลด
 
--------------------- Compat / Services --------------------
+-------------------- Services --------------------
+local TS   = game:GetService("TweenService")
+local CG   = game:GetService("CoreGui")
 local HttpService = game:GetService("HttpService")
-local MarketplaceService = game:GetService("MarketplaceService")
 
-local function LOG(msg)
-    local s = "[UFO-KEY1] " .. tostring(msg)
-    if rconsoleprint then rconsoleprint(s.."\n") else print(s) end
-end
+-------------------- CONFIG --------------------
+-- 👉 เปลี่ยนเป็น RAW URL ของไฟล์ key2 (JSON) ที่เพื่อนสร้างไว้
+local KEY_DB_URL = "https://raw.githubusercontent.com/UFO-HUB-X-Studio/UFO-HUB-X-key2/refs/heads/main/UFO-HUB-X-key2"
 
--------------------- HTTP helpers --------------------
-local function http_get(url)
-    if http and http.request then
-        local ok, res = pcall(http.request, {Url=url, Method="GET"})
-        if ok and res and (res.Body or res.body) then return true, (res.Body or res.body) end
-    end
-    if syn and syn.request then
-        local ok, res = pcall(syn.request, {Url=url, Method="GET"})
-        if ok and res and (res.Body or res.body) then return true, (res.Body or res.body) end
-    end
-    local ok, body = pcall(function() return game:HttpGet(url) end)
-    if ok and body then return true, body end
-    return false, "httpget_failed"
-end
+local LOGO_ID   = 112676905543996
+local ACCENT    = Color3.fromRGB(0,255,140)
+local BG_DARK   = Color3.fromRGB(10,10,10)
+local FG        = Color3.fromRGB(235,235,235)
+local SUB       = Color3.fromRGB(22,22,22)
 
-local function http_get_retry(urls, tries, delay_s)
-    local list = {}
-    if type(urls)=="table" then list = urls else list = {urls} end
-    tries   = tries or 2
-    delay_s = delay_s or 0.5
-    for round=1, tries do
-        for _,u in ipairs(list) do
-            LOG(("try #%d → %s"):format(round, u))
-            local ok, body = http_get(u)
-            if ok and body then return true, body, u end
-        end
-        task.wait(delay_s * round)
-    end
-    return false, "retry_failed"
-end
-
--------------------- FS cache (optional) --------------------
-local DIR        = "UFOHubX"
-local CACHE_FILE = DIR.."/key_cache.json"
-local CACHE_ENABLED = true          -- ปิด cache ตั้ง false
-local CACHE_TTL    = 900            -- วินาที (15 นาที) ถ้า server ไม่ให้ expires_at
-
-local function ensureDir()
-    if isfolder then
-        if not isfolder(DIR) then pcall(makefolder, DIR) end
-    end
-end
-ensureDir()
-
-local function readCache()
-    if not CACHE_ENABLED then return nil end
-    if not (isfile and readfile and isfile(CACHE_FILE)) then return nil end
-    local ok, data = pcall(readfile, CACHE_FILE)
-    if not ok or not data or #data==0 then return nil end
-    local ok2, js = pcall(function() return HttpService:JSONDecode(data) end)
-    if not ok2 or type(js)~="table" then return nil end
-    -- { key="...", game="...", expires_at=..., saved_at=... }
-    if js.expires_at and typeof(js.expires_at)=="number" then
-        if os.time() >= js.expires_at then return nil end
-    else
-        if js.saved_at and typeof(js.saved_at)=="number" then
-            if os.time() - js.saved_at > CACHE_TTL then return nil end
-        else
-            return nil
-        end
-    end
-    return js
-end
-
-local function writeCache(key, gameName, expires_at)
-    if not CACHE_ENABLED then return end
-    if not writefile then return end
-    local obj = {
-        key        = key,
-        game       = gameName,
-        saved_at   = os.time(),
-        expires_at = expires_at or nil,
-    }
-    local ok, json = pcall(function() return HttpService:JSONEncode(obj) end)
-    if ok then pcall(writefile, CACHE_FILE, json) end
-end
-
--------------------- Config: sources you own --------------------
--- ปรับ/เพิ่มแหล่งคีย์ได้ที่นี่ (ลำดับมาก่อน ตรวจ/ดึงก่อน)
--- TIP: ถ้าคุณมี server ที่แจกคีย์ แนะนำทำ shape JSON ที่อ่านง่าย เช่น:
---   {"key":"ABCDEF","expires_in":3600}
---   หรือ {"keys":["K1","K2"],"expires_at":1700000000}
---   หรือ {"games":{"Grow a Garden":"G-GARDEN-123","default":"FALLBACK-KEY"}}
-local ALT_KEY_SOURCES = {
-    -- ตัวอย่าง: repo key2 ของคุณ (แก้ path ตามจริง)
-    "https://raw.githubusercontent.com/UFO-HUB-X-Studio/UFO-HUB-X-key2/refs/heads/main/UFO-HUB-X-key2",
-
-    -- ถ้าคุณมี endpoint แจกคีย์จริง (ใส่เป็น template ได้)
-    -- "https://ufo-hub-x-key.onrender.com/get?user={userid}&place={placeid}",
+-- คีย์ถาวรแบบ allow-list (ผ่านทันที ใช้เทส/ฉุกเฉิน)
+local ALLOW_KEYS = {
+  ["JJJMAX"]                 = { permanent = true, reusable = true },
+  ["GMPANUPHONGARTPHAIRIN"]  = { permanent = true, reusable = true },
 }
 
--------------------- Parse candidates --------------------
-local function norm(s)
-    s = tostring(s or ""):gsub("^%s+",""):gsub("%s+$","")
-    return s
+-------------------- Compat HTTP --------------------
+local function http_get(url)
+  if http and http.request then
+    local ok, res = pcall(http.request, {Url=url, Method="GET"})
+    if ok and res and (res.Body or res.body) then return true, (res.Body or res.body) end
+  end
+  if syn and syn.request then
+    local ok, res = pcall(syn.request, {Url=url, Method="GET"})
+    if ok and res and (res.Body or res.body) then return true, (res.Body or res.body) end
+  end
+  local ok, body = pcall(function() return game:HttpGet(url) end)
+  if ok and body then return true, body end
+  return false, "httpget_failed"
 end
 
--- ดึงคีย์ที่เป็นไปได้จาก JSON หรือข้อความดิบ
--- ต้องคืน { "KEY1", "KEY2", ... }, exp(optional)
-local function parseCandidates(txt, gameName)
-    txt = tostring(txt or "")
-    local candidates = {}
-    local expires_at = nil
-
-    -- 1) ลอง JSON ก่อน
-    local isJSON, js = pcall(function() return HttpService:JSONDecode(txt) end)
-    if isJSON and type(js)=="table" then
-        -- กรณีสากล: {"key":"..."} / {"keys":[...]}
-        if type(js.key)=="string" and #js.key>0 then
-            table.insert(candidates, norm(js.key))
-        end
-        if type(js.keys)=="table" then
-            for _,k in ipairs(js.keys) do
-                if type(k)=="string" and #k>0 then table.insert(candidates, norm(k)) end
-            end
-        end
-        -- ต่อ game: {"games":{"Grow a Garden":"...","default":"..."}}
-        if type(js.games)=="table" then
-            local g = js.games[gameName]
-            if type(g)=="string" and #g>0 then table.insert(candidates, norm(g)) end
-            local fallback = js.games["default"]
-            if type(fallback)=="string" and #fallback>0 then table.insert(candidates, norm(fallback)) end
-        end
-        -- expiry
-        if js.expires_at then
-            local n = tonumber(js.expires_at); if n then expires_at = n end
-        elseif js.expires_in then
-            local n = tonumber(js.expires_in); if n then expires_at = os.time() + n end
-        end
-    else
-        -- 2) plain text: หยิบ pattern key ที่ดูสมเหตุสมผล (A-Z0-9 6+)
-        for token in txt:gmatch("[A-Za-z0-9%-_]{6,}") do
-            table.insert(candidates, norm(token))
-        end
-    end
-
-    -- dedupe
-    local seen = {}
-    local unique = {}
-    for _,k in ipairs(candidates) do
-        if not seen[k] then seen[k]=true; table.insert(unique, k) end
-    end
-    return unique, expires_at
+-------------------- Helpers --------------------
+local function log(s)
+  s = "[UFO-HUB-X/KEY] "..tostring(s)
+  if rconsoleprint then rconsoleprint(s.."\n") else print(s) end
 end
 
--------------------- Utils --------------------
-local function getGameName()
-    local ok, info = pcall(function()
-        return MarketplaceService:GetProductInfo(game.PlaceId)
+local function normKey(s)
+  s = tostring(s or ""):gsub("%c",""):gsub("%s+",""):gsub("[^%w]","")
+  return string.upper(s)
+end
+
+local function isAllowedKey(k)
+  local nk = normKey(k)
+  return (ALLOW_KEYS[nk] ~= nil), nk
+end
+
+local function safeParent(gui)
+  local ok=false
+  if syn and syn.protect_gui then pcall(function() syn.protect_gui(gui) end) end
+  if gethui then ok = pcall(function() gui.Parent = gethui() end) end
+  if not ok then gui.Parent = CG end
+end
+
+-------------------- Fetch & Validate via key2 --------------------
+-- รองรับ 2 รูปแบบ JSON:
+-- 1) { "valid_keys": ["A","B"], "expires_in": 3600 }
+-- 2) { "games": { "Grow a Garden":"A", ... }, "expires_in": 3600 }
+-- คืนค่า: (ok:boolean, expires_at:number|nil, reason:string|nil)
+local function validate_with_key2(user_key)
+  local ok, raw = http_get(KEY_DB_URL)
+  if not ok or not raw then
+    return false, nil, "unreachable"
+  end
+
+  local parsed
+  local jok, jerr = pcall(function() parsed = HttpService:JSONDecode(raw) end)
+  if not jok or type(parsed) ~= "table" then
+    return false, nil, "bad_json"
+  end
+
+  local expires_at = nil
+  -- expires_in → แปลงเป็น expires_at (ณ ตอนยืนยัน)
+  if parsed.expires_in and tonumber(parsed.expires_in) then
+    expires_at = os.time() + tonumber(parsed.expires_in)
+  end
+
+  local target = normKey(user_key)
+
+  -- แบบที่ 1: valid_keys เป็น array
+  if type(parsed.valid_keys) == "table" then
+    for _, v in ipairs(parsed.valid_keys) do
+      if normKey(v) == target then
+        return true, expires_at, nil
+      end
+    end
+    return false, nil, "not_found"
+  end
+
+  -- แบบที่ 2: games เป็น object (values คือคีย์)
+  if type(parsed.games) == "table" then
+    for gameName, keyStr in pairs(parsed.games) do
+      if normKey(keyStr) == target then
+        return true, expires_at, nil
+      end
+    end
+    return false, nil, "not_found"
+  end
+
+  return false, nil, "no_valid_keys_field"
+end
+
+-------------------- UI (เหมือนเวอร์ชันดี ๆ ที่เคยใช้) --------------------
+local gui = Instance.new("ScreenGui")
+gui.Name = "UFOHubX_KeyUI"
+gui.IgnoreGuiInset = true
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+safeParent(gui)
+
+local PANEL_W, PANEL_H = 740, 430
+local panel = Instance.new("Frame")
+panel.Parent = gui
+panel.Active = true
+panel.Draggable = true
+panel.Size = UDim2.fromOffset(PANEL_W, PANEL_H)
+panel.AnchorPoint = Vector2.new(0.5,0.5)
+panel.Position = UDim2.fromScale(0.5,0.5)
+panel.BackgroundColor3 = BG_DARK
+panel.BorderSizePixel = 0
+local panelCorner = Instance.new("UICorner", panel)
+panelCorner.CornerRadius = UDim.new(0,22)
+local panelStroke = Instance.new("UIStroke", panel)
+panelStroke.Color = ACCENT
+panelStroke.Thickness = 2
+panelStroke.Transparency = 0.1
+
+-- ปุ่มปิด (ปิดเฉย ๆ **ไม่** เรียกดาวน์โหลด)
+local btnClose = Instance.new("TextButton")
+btnClose.Parent = panel
+btnClose.Text = "X"
+btnClose.Font = Enum.Font.GothamBold
+btnClose.TextSize = 20
+btnClose.TextColor3 = Color3.new(1,1,1)
+btnClose.AutoButtonColor = false
+btnClose.BackgroundColor3 = Color3.fromRGB(210,35,50)
+btnClose.Size = UDim2.new(0,38,0,38)
+btnClose.Position = UDim2.new(1,-50,0,14)
+btnClose.ZIndex = 50
+local closeCorner = Instance.new("UICorner", btnClose)
+closeCorner.CornerRadius = UDim.new(0,12)
+btnClose.MouseButton1Click:Connect(function()
+  gui:Destroy() -- ปิดเฉย ๆ
+end)
+
+-- HEADER
+local head = Instance.new("Frame")
+head.Parent = panel
+head.BackgroundTransparency = 0.15
+head.BackgroundColor3 = Color3.fromRGB(14,14,14)
+head.Size = UDim2.new(1,-28,0,68)
+head.Position = UDim2.new(0,14,0,14)
+local hc = Instance.new("UICorner", head)  hc.CornerRadius = UDim.new(0,16)
+local hs = Instance.new("UIStroke", head)  hs.Color = ACCENT  hs.Transparency = 0.85
+
+local logo = Instance.new("ImageLabel")
+logo.Parent = head
+logo.BackgroundTransparency = 1
+logo.Image = "rbxassetid://"..LOGO_ID
+logo.Size = UDim2.new(0,34,0,34)
+logo.Position = UDim2.new(0,16,0,17)
+
+local title = Instance.new("TextLabel")
+title.Parent = head
+title.BackgroundTransparency = 1
+title.Position = UDim2.new(0,60,0,18)
+title.Size = UDim2.new(0,200,0,32)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 20
+title.Text = "KEY SYSTEM"
+title.TextColor3 = ACCENT
+title.TextXAlignment = Enum.TextXAlignment.Left
+
+-- LABEL "Key"
+local keyLbl = Instance.new("TextLabel")
+keyLbl.Parent = panel
+keyLbl.BackgroundTransparency = 1
+keyLbl.Position = UDim2.new(0,28,0,188)
+keyLbl.Size = UDim2.new(0,60,0,22)
+keyLbl.Font = Enum.Font.Gotham
+keyLbl.TextSize = 16
+keyLbl.Text = "Key"
+keyLbl.TextColor3 = Color3.fromRGB(200,200,200)
+keyLbl.TextXAlignment = Enum.TextXAlignment.Left
+
+-- INPUT
+local keyBox = Instance.new("TextBox")
+keyBox.Parent = panel
+keyBox.ClearTextOnFocus = false
+keyBox.PlaceholderText = "insert your key here"
+keyBox.Font = Enum.Font.Gotham
+keyBox.TextSize = 16
+keyBox.Text = ""
+keyBox.TextColor3 = FG
+keyBox.BackgroundColor3 = SUB
+keyBox.BorderSizePixel = 0
+keyBox.Size = UDim2.new(1,-56,0,40)
+keyBox.Position = UDim2.new(0,28,0,214)
+local keyCorner = Instance.new("UICorner", keyBox)
+keyCorner.CornerRadius = UDim.new(0,12)
+local keyStroke = Instance.new("UIStroke", keyBox)
+keyStroke.Color = ACCENT
+keyStroke.Transparency = 0.75
+
+-- BUTTON
+local RED   = Color3.fromRGB(210,60,60)
+local GREEN = Color3.fromRGB(60,200,120)
+
+local btnSubmit = Instance.new("TextButton")
+btnSubmit.Parent = panel
+btnSubmit.Text = "🔒  Submit Key"
+btnSubmit.Font = Enum.Font.GothamBlack
+btnSubmit.TextSize = 20
+btnSubmit.TextColor3 = Color3.new(1,1,1)
+btnSubmit.AutoButtonColor = false
+btnSubmit.BackgroundColor3 = RED
+btnSubmit.BorderSizePixel = 0
+btnSubmit.Size = UDim2.new(1,-56,0,50)
+btnSubmit.Position = UDim2.new(0,28,0,268)
+local btnCorner = Instance.new("UICorner", btnSubmit)
+btnCorner.CornerRadius = UDim.new(0,14)
+
+-- STATUS
+local statusLabel = Instance.new("TextLabel")
+statusLabel.Parent = panel
+statusLabel.BackgroundTransparency = 1
+statusLabel.Position = UDim2.new(0,28,0,268+50+6)
+statusLabel.Size = UDim2.new(1,-56,0,24)
+statusLabel.Font = Enum.Font.Gotham
+statusLabel.TextSize = 14
+statusLabel.Text = ""
+statusLabel.TextColor3 = Color3.fromRGB(200,200,200)
+statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+local function setStatus(txt, ok)
+  statusLabel.Text = txt or ""
+  if ok == nil then
+    statusLabel.TextColor3 = Color3.fromRGB(200,200,200)
+  elseif ok then
+    statusLabel.TextColor3 = Color3.fromRGB(120,255,170)
+  else
+    statusLabel.TextColor3 = Color3.fromRGB(255,120,120)
+  end
+end
+
+-- TOAST
+local toast = Instance.new("TextLabel")
+toast.Parent = panel
+toast.BackgroundTransparency = 0.15
+toast.BackgroundColor3 = Color3.fromRGB(30,30,30)
+toast.Size = UDim2.fromOffset(0,32)
+toast.Position = UDim2.new(0.5,0,0,16)
+toast.AnchorPoint = Vector2.new(0.5,0)
+toast.Visible = false
+toast.Font = Enum.Font.GothamBold
+toast.TextSize = 14
+toast.Text = ""
+toast.TextColor3 = Color3.new(1,1,1)
+toast.ZIndex = 100
+local tpad = Instance.new("UIPadding", toast)
+tpad.PaddingLeft = UDim.new(0,14)  tpad.PaddingRight = UDim.new(0,14)
+local tcorner = Instance.new("UICorner", toast)  tcorner.CornerRadius = UDim.new(0,10)
+
+local function showToast(msg, ok)
+  toast.Text = msg
+  toast.TextColor3 = Color3.new(1,1,1)
+  toast.BackgroundColor3 = ok and Color3.fromRGB(20,120,60) or Color3.fromRGB(150,35,35)
+  toast.Size = UDim2.fromOffset(math.max(200, (#msg*8)+28), 32)
+  toast.Visible = true
+  toast.BackgroundTransparency = 0.15
+  TS:Create(toast, TweenInfo.new(.08), {BackgroundTransparency = 0.05}):Play()
+  task.delay(1.1, function()
+    TS:Create(toast, TweenInfo.new(.15), {BackgroundTransparency = 1}):Play()
+    task.delay(.15, function() toast.Visible = false end)
+  end)
+end
+
+-- EFFECTS
+local function refreshBtn()
+  local has = keyBox.Text and #keyBox.Text > 0
+  if has then
+    TS:Create(btnSubmit, TweenInfo.new(.08), {BackgroundColor3 = GREEN}):Play()
+    btnSubmit.TextColor3 = Color3.new(0,0,0)
+    btnSubmit.Text = "🔓  Submit Key"
+  else
+    TS:Create(btnSubmit, TweenInfo.new(.08), {BackgroundColor3 = RED}):Play()
+    btnSubmit.TextColor3 = Color3.new(1,1,1)
+    btnSubmit.Text = "🔒  Submit Key"
+  end
+end
+
+local function flashInputError()
+  local old = keyStroke.Color
+  TS:Create(keyStroke, TweenInfo.new(.05), {Color = Color3.fromRGB(255,90,90), Transparency = 0}):Play()
+  task.delay(.22, function()
+    TS:Create(keyStroke, TweenInfo.new(.12), {Color = old, Transparency = 0.75}):Play()
+  end)
+end
+
+local function forceErrorUI(mainText, subText)
+  TS:Create(btnSubmit, TweenInfo.new(.08), {BackgroundColor3 = Color3.fromRGB(255,80,80)}):Play()
+  btnSubmit.Text = mainText or "❌ Invalid Key"
+  btnSubmit.TextColor3 = Color3.new(1,1,1)
+  setStatus(subText or "กุญแจไม่ถูกต้อง ลองอีกครั้ง", false)
+  showToast(subText or "รหัสไม่ถูกต้อง", false)
+  flashInputError()
+  keyBox.Text = ""
+  task.delay(0.02, function() keyBox:CaptureFocus() end)
+  task.delay(1.1, function() refreshBtn() end)
+end
+
+local function successAndClose(k, expires_at, permanent)
+  -- แจ้งให้ orchestrator บันทึกสถานะคีย์
+  if _G and _G.UFO_SaveKeyState then
+    _G.UFO_SaveKeyState(k, expires_at, permanent and true or false)
+  end
+  -- สั่งให้ไปหน้า Download (เฉพาะ "ผ่าน" เท่านั้น)
+  if _G and _G.UFO_StartDownload then
+    _G.UFO_StartDownload()
+  end
+  gui:Destroy()
+end
+
+-- EVENTS
+keyBox:GetPropertyChangedSignal("Text"):Connect(function()
+  setStatus("", nil)
+  refreshBtn()
+end)
+refreshBtn()
+
+-- SUBMIT FLOW
+local submitting = false
+local function doSubmit()
+  if submitting then return end
+  submitting = true
+  btnSubmit.Active = false
+
+  local raw = keyBox.Text or ""
+  if raw == "" then
+    submitting = false
+    forceErrorUI("🚫 Please enter a key","โปรดใส่รหัสก่อนนะ")
+    return
+  end
+
+  setStatus("กำลังตรวจสอบคีย์...", nil)
+  TS:Create(btnSubmit, TweenInfo.new(.08), {BackgroundColor3 = Color3.fromRGB(70,170,120)}):Play()
+  btnSubmit.Text = "⏳ Verifying..."
+
+  -- 1) allow-list
+  local allowed, nk = isAllowedKey(raw)
+  if allowed then
+    TS:Create(btnSubmit, TweenInfo.new(.10), {BackgroundColor3 = Color3.fromRGB(120,255,170)}):Play()
+    btnSubmit.Text = "✅ Key accepted"
+    btnSubmit.TextColor3 = Color3.new(0,0,0)
+    setStatus("ยืนยันคีย์สำเร็จ (Allow-list)", true)
+    task.delay(.25, function()
+      submitting = false
+      successAndClose(raw, nil, true) -- ถาวร
     end)
-    if ok and info and info.Name then return tostring(info.Name) end
-    return "default"
-end
+    return
+  end
 
-local function applyTemplate(url)
-    -- รองรับ {userid} {username} {placeid}
-    local player = game.Players.LocalPlayer
-    local uid = (player and player.UserId) or 0
-    local uname = (player and player.Name) or "Player"
-    local pid = game.PlaceId or 0
-    local out = url
-    out = out:gsub("{userid}", tostring(uid))
-    out = out:gsub("{username}", tostring(uname))
-    out = out:gsub("{placeid}", tostring(pid))
-    return out
-end
-
--------------------- Main: findKey(gameName) --------------------
-local M = {}
-
--- คืน string เดียว (ตัวที่ดีที่สุด) หรือ table ของตัวเลือกทั้งหมด (ให้ UI ตัดสินใจต่อได้)
-function M.findKey(gameName)
-    gameName = tostring(gameName or getGameName())
-    LOG("findKey for game: "..gameName)
-
-    -- 1) ใช้ cache ก่อน (ถ้าเกมตรงกัน)
-    local cache = readCache()
-    if cache and type(cache.key)=="string" and cache.game == gameName then
-        LOG("use cache key")
-        return cache.key
-    end
-
-    -- 2) ไล่ยิงแหล่งข้อมูลที่กำหนด
-    local allCandidates = {}
-    local bestExpiry = nil
-
-    for _, base in ipairs(ALT_KEY_SOURCES) do
-        local url = applyTemplate(base)
-        local ok, body = http_get(url)
-        if ok and body and #body>0 then
-            local items, exp = parseCandidates(body, gameName)
-            if items and #items>0 then
-                -- เก็บ candidates ทั้งหมด (เพื่อให้ UI ใช้หลายช้อยส์ได้)
-                for _,k in ipairs(items) do table.insert(allCandidates, k) end
-                if exp and (not bestExpiry or exp > bestExpiry) then bestExpiry = exp end
-            end
-        end
-    end
-
-    -- 3) dedupe ผู้สมัครทั้งหมด
-    do
-        local seen = {}
-        local uniq = {}
-        for _,k in ipairs(allCandidates) do
-            if type(k)=="string" and #k>0 then
-                local nk = k
-                if not seen[nk] then seen[nk]=true; table.insert(uniq, nk) end
-            end
-        end
-        allCandidates = uniq
-    end
-
-    -- 4) ตัดสินใจคืนค่า
-    if #allCandidates == 0 then
-        LOG("no key candidates found")
-        return nil
-    elseif #allCandidates == 1 then
-        -- เขียน cache
-        writeCache(allCandidates[1], gameName, bestExpiry)
-        return allCandidates[1]
+  -- 2) ตรวจจริงกับ key2 (JSON)
+  local ok, exp, reason = validate_with_key2(raw)
+  if not ok then
+    submitting = false
+    if reason == "unreachable" then
+      forceErrorUI("❌ Invalid Key", "เชื่อมต่อฐานข้อมูลคีย์ไม่ได้ (ลองใหม่)")
+    elseif reason == "bad_json" then
+      forceErrorUI("❌ Invalid Key", "รูปแบบข้อมูลคีย์เสีย (ติดต่อแอดมิน)")
+    elseif reason == "no_valid_keys_field" then
+      forceErrorUI("❌ Invalid Key", "ไม่มีฟิลด์ valid_keys/games (ติดต่อแอดมิน)")
     else
-        -- หลายตัวเลือก → เขียน cache ตัวแรกไว้ก่อน (แก้ภายหลังได้)
-        writeCache(allCandidates[1], gameName, bestExpiry)
-        return allCandidates
+      forceErrorUI("❌ Invalid Key", "รหัสไม่ถูกต้อง")
     end
+    return
+  end
+
+  -- ผ่าน ✅
+  TS:Create(btnSubmit, TweenInfo.new(.10), {BackgroundColor3 = Color3.fromRGB(120,255,170)}):Play()
+  btnSubmit.Text = "✅ Key accepted"
+  btnSubmit.TextColor3 = Color3.new(0,0,0)
+  setStatus("ยืนยันคีย์สำเร็จ พร้อมใช้งาน!", true)
+  task.delay(.25, function()
+    submitting = false
+    successAndClose(raw, exp, false)
+  end)
 end
 
-return M
+btnSubmit.MouseButton1Click:Connect(doSubmit)
+keyBox.FocusLost:Connect(function(enter) if enter then doSubmit() end end)
+
+-- Open anim
+panel.Position = UDim2.fromScale(0.5,0.5) + UDim2.fromOffset(0,14)
+TS:Create(panel, TweenInfo.new(.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Position = UDim2.fromScale(0.5,0.5)}):Play()

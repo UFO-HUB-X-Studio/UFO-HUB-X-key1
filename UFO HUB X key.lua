@@ -271,3 +271,8 @@ keyBox.FocusLost:Connect(function(enter) if enter then doSubmit() end end)
 -- แอนิเมชันเข้า
 panel.Position = UDim2.fromScale(0.5,0.5) + UDim2.fromOffset(0,14)
 TS:Create(panel, TweenInfo.new(.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Position=UDim2.fromScale(0.5,0.5)}):Play()
+
+local SERVER_BASE = "https://ufo-hub-x-server-key2.onrender.com"
+local URL_KEYS = {
+  "https://raw.githubusercontent.com/UFO-HUB-X-Studio/UFO-HUB-X-key1/refs/heads/main/UFO%20HUB%20X%20key.lua"
+}

@@ -3,8 +3,8 @@
 -- รองรับ Delta / syn / KRNL / Script-Ware / Fluxus / Solara ฯลฯ + loadstring(HttpGet)
 -- จัดเต็ม: Patch Key/Download ให้ยิงสัญญาณ, Watchers หลายชั้น, Retry/Backoff, Force Main fallback
 -- + เพิ่ม: FORCE_KEY_UI, Hotkey ลบคีย์แล้วรีโหลด (RightAlt), deleteState(), reloadSelf()
--- + เพิ่ม (ใหม่): Force Key First บังคับให้ Key UI แสดงก่อนเสมอ (ปรับได้ด้วย getgenv().UFO_FORCE_KEY_UI)
--- + FIX: กดปุ่ม X ใน Key UI จะไม่ไปหน้า Download อีกต่อไป (เรียก Download เฉพาะตอนคีย์ผ่าน)
+-- + เพิ่ม: Force Key First (getgenv().UFO_FORCE_KEY_UI)
+-- + เพิ่ม: External Key (เข้ารหัส) → UFO-HUB-X-Studio/UFO-HUB-X-key1
 
 --========================================================
 -- Services + Compat
@@ -32,8 +32,7 @@ local function http_get(url)
 end
 
 local function http_get_retry(urls, tries, delay_s)
-    local list = {}
-    if type(urls)=="table" then list = urls else list = {urls} end
+    local list = (type(urls)=="table") and urls or {urls}
     tries   = tries or 3
     delay_s = delay_s or 0.75
     local attempt = 0
@@ -58,7 +57,7 @@ local function safe_loadstring(src, tag)
 end
 
 --========================================================
--- FS: Persist key state
+-- FS: Persist key state (หลัก)
 --========================================================
 local DIR        = "UFOHubX"
 local STATE_FILE = DIR.."/key_state.json"
@@ -84,21 +83,131 @@ local function writeState(tbl)
     if ok then pcall(writefile, STATE_FILE, json) end
 end
 
--- ลบไฟล์ state (ใช้ตอนเคลียร์คีย์)
 local function deleteState()
     if isfile and isfile(STATE_FILE) and delfile then pcall(delfile, STATE_FILE) end
 end
 
 --========================================================
--- [ADD] External key save + import (เพิ่มอย่างเดียว ไม่แตะของเดิม)
+-- [ADD] External key save + import (ENCRYPTED)
 --========================================================
-local EXT_DIR      = "UFO-HUB-X-Studio"          -- ตามที่ขอ
-local EXT_KEY_FILE = EXT_DIR.."/UFO-HUB-X-key1"  -- ไฟล์ภายนอก
+local EXT_DIR      = "UFO-HUB-X-Studio"
+local EXT_KEY_FILE = EXT_DIR.."/UFO-HUB-X-key1"
+
+-- เปลี่ยนได้: ความลับสำหรับสตรีมเข้ารหัส
+local ENC_SECRET = "UFOX|2025-KEY-SEALED|:)"
+local ENC_VER    = 1
 
 local function ensureExtDir()
-    if isfolder and not isfolder(EXT_DIR) then
-        pcall(makefolder, EXT_DIR)
+    if isfolder and not isfolder(EXT_DIR) then pcall(makefolder, EXT_DIR) end
+end
+
+-- helpers
+local function str_to_bytes(s)
+    local t = table.create(#s)
+    for i=1,#s do t[i] = string.byte(s,i) end
+    return t
+end
+local function bytes_to_str(t)
+    local c = table.create(#t)
+    for i=1,#t do c[i] = string.char(t[i] % 256) end
+    return table.concat(c)
+end
+
+-- base64
+local B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+local function b64_encode(data)
+    local bytes = type(data)=="table" and data or str_to_bytes(tostring(data or ""))
+    local out, val, valb = {}, 0, -6
+    for i=1,#bytes do
+        val = (val << 8) | (bytes[i] & 0xFF)
+        valb = valb + 8
+        while valb >= 0 do
+            local idx = ((val >> valb) & 0x3F) + 1
+            out[#out+1] = string.sub(B64, idx, idx)
+            valb = valb - 6
+        end
     end
+    if valb > -6 then
+        local idx = (((val << 8) >> (valb + 8)) & 0x3F) + 1
+        out[#out+1] = string.sub(B64, idx, idx)
+    end
+    while (#out % 4) ~= 0 do out[#out+1] = "=" end
+    return table.concat(out)
+end
+local function b64_decode(s)
+    s = tostring(s or ""):gsub("[^%w%+/%=]", "")
+    local T = {}
+    for i=1,#B64 do T[string.sub(B64,i,i)] = i-1 end
+    local out, val, valb = {}, 0, -8
+    for i=1,#s do
+        local c = string.sub(s,i,i)
+        if c ~= "=" then
+            local v = T[c]; if not v then goto continue end
+            val = (val << 6) | v
+            valb = valb + 6
+            if valb >= 0 then
+                out[#out+1] = ( (val >> valb) & 0xFF )
+                val = val & ((1 << valb) - 1)
+                valb = valb - 8
+            end
+        end
+        ::continue::
+    end
+    return out
+end
+
+local function bxor(a,b) return (a ~ b) & 0xFF end
+
+-- stream key (LCG)
+local function derive_stream(len, iv)
+    local seed = 0
+    local mix  = (ENC_SECRET .. "|" .. tostring(iv or ""))
+    for i=1,#mix do
+        seed = ( (seed * 131) + string.byte(mix,i) ) % 4294967296
+    end
+    local function next_byte()
+        seed = (1103515245 * seed + 12345) % 4294967296
+        return seed % 256
+    end
+    local t = table.create(len)
+    for i=1,len do t[i] = next_byte() end
+    return t
+end
+
+local function simple_checksum(bytes, iv)
+    local sum = 2166136261
+    for i=1,#bytes do
+        sum = (sum ~ bytes[i]) & 0xFFFFFFFF
+        sum = (sum * 16777619) % 4294967296
+    end
+    local ivb = str_to_bytes(tostring(iv or ""))
+    for i=1,#ivb do
+        sum = (sum ~ ivb[i]) & 0xFFFFFFFF
+        sum = (sum * 16777619) % 4294967296
+    end
+    return tostring(sum)
+end
+
+local function encrypt_str(plain, iv)
+    local pbytes = str_to_bytes(plain)
+    local key    = derive_stream(#pbytes, iv)
+    local out    = table.create(#pbytes)
+    for i=1,#pbytes do out[i] = bxor(pbytes[i], key[i]) end
+    local b64 = b64_encode(out)
+    local sig = simple_checksum(pbytes, iv)
+    return b64, sig
+end
+
+local function decrypt_str(b64, iv, sig)
+    local bytes = b64_decode(b64 or "")
+    if #bytes == 0 then return false, "empty" end
+    local key   = derive_stream(#bytes, iv)
+    local out   = table.create(#bytes)
+    for i=1,#bytes do out[i] = bxor(bytes[i], key[i]) end
+    local plain = bytes_to_str(out)
+    local okSig = (simple_checksum(out, iv) == tostring(sig or ""))
+    if not okSig then return false, "bad_signature" end
+    return true, plain
 end
 
 local function saveKeyExternal(key, expires_at, permanent)
@@ -110,16 +219,12 @@ local function saveKeyExternal(key, expires_at, permanent)
         expires_at = expires_at or nil,
         saved_at   = os.time(),
     }
-    local ok, json = pcall(function() return HttpService:JSONEncode(payload) end)
-    if ok and json and #json > 0 then
-        pcall(writefile, EXT_KEY_FILE, json)
-    else
-        -- fallback text
-        local line = string.format("%s|perm=%s|exp=%s|t=%d",
-            tostring(key or ""), tostring(permanent and true or false),
-            tostring(expires_at or "nil"), os.time())
-        pcall(writefile, EXT_KEY_FILE, line)
-    end
+    local json = HttpService:JSONEncode(payload)
+    local iv   = ("%08x%08x"):format(os.time() % 0xFFFFFFFF, math.random(0, 0x7FFFFFFF))
+    local data, sig = encrypt_str(json, iv)
+    local envelope = { v=ENC_VER, enc="xor-b64", iv=iv, sig=sig, data=data }
+    local ok, outJson = pcall(function() return HttpService:JSONEncode(envelope) end)
+    if ok and outJson then pcall(writefile, EXT_KEY_FILE, outJson) end
 end
 
 local function readKeyExternal()
@@ -127,26 +232,47 @@ local function readKeyExternal()
     local ok, data = pcall(readfile, EXT_KEY_FILE)
     if not ok or not data or #data == 0 then return nil end
 
-    -- JSON ก่อน
-    local tryJson, decoded = pcall(function() return HttpService:JSONDecode(data) end)
-    if tryJson and type(decoded) == "table" and decoded.key then
+    -- รูปแบบเข้ารหัส
+    local ok1, env = pcall(function() return HttpService:JSONDecode(data) end)
+    if ok1 and type(env)=="table" and env.enc=="xor-b64" and env.data and env.iv then
+        local ok2, plain = decrypt_str(env.data, env.iv, env.sig)
+        if not ok2 then return nil end
+        local ok3, decoded = pcall(function() return HttpService:JSONDecode(plain) end)
+        if ok3 and type(decoded)=="table" then
+            return {
+                key        = tostring(decoded.key or ""),
+                permanent  = decoded.permanent and true or false,
+                expires_at = tonumber(decoded.expires_at) or nil
+            }
+        end
+        return nil
+    end
+
+    -- ไฟล์เก่า (Plain JSON)
+    local okJ, old = pcall(function() return HttpService:JSONDecode(data) end)
+    if okJ and type(old)=="table" and old.key then
+        pcall(saveKeyExternal, old.key, tonumber(old.expires_at) or nil, old.permanent and true or false) -- upgrade
         return {
-            key        = tostring(decoded.key or ""),
-            permanent  = decoded.permanent and true or false,
-            expires_at = tonumber(decoded.expires_at) or nil
+            key        = tostring(old.key or ""),
+            permanent  = old.permanent and true or false,
+            expires_at = tonumber(old.expires_at) or nil
         }
     end
 
-    -- ข้อความธรรมดา
+    -- ไฟล์เก่า (Plain Text)
     local line = tostring(data):gsub("%s+$","")
     local key  = line:match("^[^|\r\n]+") or line
     local perm = line:match("perm%s*=%s*(%w+)") or "false"
     local exp  = line:match("exp%s*=%s*(%d+)")
-    return {
-        key        = key,
-        permanent  = (perm:lower() == "true"),
-        expires_at = exp and tonumber(exp) or nil
-    }
+    if key and #key > 0 then
+        pcall(saveKeyExternal, key, exp and tonumber(exp) or nil, (perm:lower()=="true")) -- upgrade
+        return {
+            key        = key,
+            permanent  = (perm:lower()=="true"),
+            expires_at = exp and tonumber(exp) or nil
+        }
+    end
+    return nil
 end
 
 --========================================================
@@ -167,15 +293,9 @@ local ALLOW_KEYS = {
     ["GMPANUPHONGARTPHAIRIN"] = { permanent=true,  reusable=true, expires_at=nil },
 }
 
--- ตัวเลือกบังคับแสดง Key UI (ไว้เทสต์)
 local FORCE_KEY_UI = false
-
--- Hotkey เคลียร์คีย์ + รีโหลดสคริปต์ (RightAlt)
 local ENABLE_CLEAR_HOTKEY = true
 local CLEAR_HOTKEY        = Enum.KeyCode.RightAlt
-
--- ใช้กับ reloadSelf (ตั้งค่านี้ตอนเรียก)
--- getgenv().UFO_BootURL = "https://raw.githubusercontent.com/<YOU>/<REPO>/main/UI%20MAX%20Script.lua"
 
 local function normKey(s)
     s = tostring(s or ""):gsub("%c",""):gsub("%s+",""):gsub("[^%w]","")
@@ -225,14 +345,12 @@ local function reloadSelf()
 end
 
 --========================================================
--- Global callbacks (Key/Download/Main เรียกใช้)
+-- Global callbacks (Key/Download/Main)
 --========================================================
 _G.UFO_SaveKeyState = function(key, expires_at, permanent)
     log(("SaveKeyState: key=%s exp=%s perm=%s"):format(tostring(key), tostring(expires_at), tostring(permanent)))
     saveKeyState(key, expires_at, permanent)
-
-    -- [ADD] Duplicate-save ไปยัง UFO-HUB-X-Studio/UFO-HUB-X-key1
-    pcall(saveKeyExternal, key, expires_at, permanent)
+    pcall(saveKeyExternal, key, expires_at, permanent) -- duplicate (encrypted)
 
     _G.UFO_HUBX_KEY_OK   = true
     _G.UFO_HUBX_KEY      = key
@@ -244,13 +362,12 @@ _G.UFO_StartDownload = function()
     if _G.__UFO_Download_Started then return end
     _G.__UFO_Download_Started = true
     log("Start Download UI (signal)")
-    local ok, src, used = http_get_retry(URL_DOWNLOADS, 5, 0.8)
+    local ok, src = http_get_retry(URL_DOWNLOADS, 5, 0.8)
     if not ok then
         log("Download UI fetch failed → Force Main UI fallback")
         if _G and _G.UFO_ShowMain then _G.UFO_ShowMain() end
         return
     end
-    -- Patch Download UI: เรียก UFO_ShowMain ตอนจบเสมอ
     do
         local patched = src
         local injected = 0
@@ -280,7 +397,7 @@ _G.UFO_ShowMain = function()
     if _G.__UFO_Main_Started then return end
     _G.__UFO_Main_Started = true
     log("Show Main UI")
-    local ok, src, used = http_get_retry(URL_MAINS, 5, 0.8)
+    local ok, src = http_get_retry(URL_MAINS, 5, 0.8)
     if not ok then
         log("Main UI fetch failed. Please check your GitHub raw URL.")
         return
@@ -356,41 +473,33 @@ end
 --========================================================
 startUltimateWatchdog(180)
 
--- Force Key First (บังคับ Key UI ก่อนเสมอถ้าไม่ตั้งค่าเอง)
 do
     local env = (getgenv and getgenv().UFO_FORCE_KEY_UI)
-    if env == nil then
-        FORCE_KEY_UI = true
-    else
-        FORCE_KEY_UI = env and true or false
-    end
+    if env == nil then FORCE_KEY_UI = true else FORCE_KEY_UI = env and true or false end
 end
 
 local cur   = readState()
 local valid = isKeyStillValid(cur)
 
--- [ADD] ถ้า state เดิมยังไม่ valid → ลองโหลดจากไฟล์ภายนอก
+-- ลองโหลดจากไฟล์ภายนอก (เข้ารหัส/เก่า) ถ้า state เดิมยังไม่ valid
 do
     if not valid then
         local ext = readKeyExternal()
         if ext and ext.key and #tostring(ext.key) > 0 then
             local okToUse = false
-            if ext.permanent == true then
-                okToUse = true
-            elseif ext.expires_at and typeof(ext.expires_at)=="number" and os.time() < ext.expires_at then
-                okToUse = true
-            end
-            if okToUse and _G and type(_G.UFO_SaveKeyState) == "function" then
+            if ext.permanent == true then okToUse = true
+            elseif ext.expires_at and typeof(ext.expires_at)=="number" and os.time() < ext.expires_at then okToUse = true end
+            if okToUse and _G and type(_G.UFO_SaveKeyState)=="function" then
                 _G.UFO_SaveKeyState(ext.key, ext.expires_at, ext.permanent)
                 cur   = readState()
                 valid = isKeyStillValid(cur)
-                log("Imported key from external file: " .. tostring(ext.key))
+                log("Imported key from external file (encrypted/legacy).")
             end
         end
     end
 end
 
--- ======= โหมดบังคับ Key UI ก่อนเสมอ =======
+-- ===== Force Key UI ก่อนเสมอ (ถ้าเปิด) =====
 if FORCE_KEY_UI then
     log("FORCE_KEY_UI = true → show Key UI (first)")
     startKeyWatcher(120)
@@ -402,30 +511,21 @@ if FORCE_KEY_UI then
         return
     end
     do
-        local patched = src
-        local injected = 0
-        -- FIX: เรียก Download เฉพาะเมื่อ KEY_OK จริง
-        patched, injected = patched:gsub(
-            "gui:Destroy%(%);?",
+        local patched, injected = src, 0
+        patched, injected = patched:gsub("gui:Destroy%(%);?",
             [[
 if _G and _G.UFO_HUBX_KEY_OK and _G.UFO_StartDownload then _G.UFO_StartDownload() end
 gui:Destroy();
-]]
-        )
+]])
         if injected == 0 then
-            -- สำรอง: inject หลังข้อความ "✅ Key accepted"
-            patched, injected = patched:gsub(
-                'btnSubmit.Text%s*=%s*"✅ Key accepted"',
-                [[btnSubmit.Text = "✅ Key accepted"
+            patched, injected = patched:gsub('btnSubmit.Text%s*=%s*"✅ Key accepted"',
+            [[btnSubmit.Text = "✅ Key accepted"
 if _G and _G.UFO_StartDownload then _G.UFO_StartDownload() end
-]]
-            )
+]])
         end
         if injected > 0 then
             log("Patched Key UI to call UFO_StartDownload() only when key is OK.")
             src = patched
-        else
-            log("No patch point found in Key UI (ok if it calls itself).")
         end
     end
     local ok2, err = safe_loadstring(src, "UFOHubX_Key")
@@ -433,7 +533,7 @@ if _G and _G.UFO_StartDownload then _G.UFO_StartDownload() end
     return
 end
 
--- ======= โหมดปกติ (ไม่ force) =======
+-- ===== โหมดปกติ =====
 if valid then
     log("Key valid → skip Key UI → go Download")
     _G.UFO_HUBX_KEY_OK   = true
@@ -449,15 +549,12 @@ if valid then
         return
     end
     do
-        local patched = src
-        local injected = 0
-        patched, injected = patched:gsub(
-            "gui:Destroy%(%);?",
+        local patched, injected = src, 0
+        patched, injected = patched:gsub("gui:Destroy%(%);?",
             [[
 if _G and _G.UFO_ShowMain then _G.UFO_ShowMain() end
 gui:Destroy();
-]]
-        )
+]])
         if injected > 0 then
             log("Patched Download UI (skip-key path) to always call UFO_ShowMain().")
             src = patched
@@ -480,29 +577,15 @@ else
         return
     end
     do
-        local patched = src
-        local injected = 0
-        -- FIX: เรียก Download เฉพาะเมื่อ KEY_OK จริง
-        patched, injected = patched:gsub(
-            "gui:Destroy%(%);?",
+        local patched, injected = src, 0
+        patched, injected = patched:gsub("gui:Destroy%(%);?",
             [[
 if _G and _G.UFO_HUBX_KEY_OK and _G.UFO_StartDownload then _G.UFO_StartDownload() end
 gui:Destroy();
-]]
-        )
-        if injected == 0 then
-            patched, injected = patched:gsub(
-                'btnSubmit.Text%s*=%s*"✅ Key accepted"',
-                [[btnSubmit.Text = "✅ Key accepted"
-if _G and _G.UFO_StartDownload then _G.UFO_StartDownload() end
-]]
-            )
-        end
+]])
         if injected > 0 then
             log("Patched Key UI to call UFO_StartDownload() only when key is OK.")
             src = patched
-        else
-            log("No patch point found in Key UI (ok if it calls itself).")
         end
     end
     local ok2, err = safe_loadstring(src, "UFOHubX_Key")
